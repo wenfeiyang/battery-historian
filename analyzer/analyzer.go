@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -46,12 +47,14 @@ import (
 const (
 	maxFileSize     = 50 * 1024 * 1024 // 50 MB Limit
 	minSupportedSDK = 21               // We only support Lollipop bug reports and above
+	batteryFileLocalDir = "/Users/apple/workspace/php/quality_monitor/storage/app"
 )
 
 var (
 	// Initialized in InitTemplates()
 	uploadTempl *template.Template
 	resultTempl *template.Template
+	getTempl *template.Template
 
 	isOptimizedJs bool
 )
@@ -85,6 +88,10 @@ func InitTemplates() {
 	resultTempl = template.Must(template.ParseFiles(
 		"templates/body.html", "templates/summaries.html"),
 	)
+
+	getTempl = template.Must(template.ParseFiles(
+		"templates/base.html", "templates/main.html", "templates/summaries.html"),
+	)
 }
 
 // SetIsOptimized sets whether the JS will be optimized.
@@ -105,6 +112,97 @@ func closeConnection(w http.ResponseWriter, s string) {
 	conn.Close()
 }
 
+func Exists(name string) bool {
+    if _, err := os.Stat(name); err != nil {
+	    if os.IsNotExist(err) {
+	        return false
+	    }
+    }
+    return true
+}
+
+func DoAnalyze(battery_path string, w http.ResponseWriter) {
+	log.Printf("Trace started analyzing file.")
+
+	// Generate the Historian plot and parsing simultaneously.
+	historianCh := make(chan historianData)
+	summariesCh := make(chan summariesData)
+	checkinCh := make(chan checkinData)
+
+	b, err := ioutil.ReadFile(battery_path)
+	historianOutput := historianData{"", err}
+
+	if err != nil {
+		http.Error(w, "Failed to read file. Please try again.", http.StatusInternalServerError)
+		return
+	} else {
+		go func() {
+			html, err := generateHistorianPlot(w, path.Base(battery_path), battery_path)
+			historianCh <- historianData{html, err}
+			log.Printf("Trace finished generating Historian plot.")
+		}()
+	}
+
+	contents := string(b)
+
+	var errs []error
+	sdk, err := sdkVersion(contents)
+	if sdk < minSupportedSDK {
+		errs = append(errs, errors.New("unsupported bug report version"))
+	}
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	if sdk >= minSupportedSDK {
+		// No point running these if we don't support the sdk version since we won't get any data from them.
+		go func() {
+			o, c, errs := analyze(contents)
+			summariesCh <- summariesData{o, c, errs}
+			log.Printf("Trace finished processing summary data.")
+		}()
+
+		go func() {
+			var ctr checkinutil.IntCounter
+
+			/* Extract Build Fingerprint from the bugreport. */
+			s := &sessionpb.Checkin{
+				Checkin:          proto.String(contents),
+				BuildFingerprint: proto.String(extractBuildFingerprint(contents)),
+			}
+			pkgs, pkgErrs := packageutils.ExtractAppsFromBugReport(contents)
+			stats, warnings, pbsErrs := checkinparse.ParseBatteryStats(&ctr, checkinparse.CreateCheckinReport(s), pkgs)
+			checkinCh <- checkinData{stats, warnings, append(pkgErrs, pbsErrs...)}
+		}()
+	}
+
+	if historianOutput.err == nil {
+		historianOutput = <-historianCh
+	}
+
+	if historianOutput.err != nil {
+		historianOutput.html = fmt.Sprintf("Error generating historian plot: %v", historianOutput.err)
+	}
+
+	var summariesOutput summariesData
+	var checkinOutput checkinData
+	if sdk >= minSupportedSDK {
+		summariesOutput = <-summariesCh
+		checkinOutput = <-checkinCh
+		errs = append(errs, append(summariesOutput.errs, checkinOutput.err...)...)
+	}
+
+	log.Printf("Trace finished generating Historian plot and summaries.")
+
+	data := presenter.Data(sdk, modelName(contents), summariesOutput.historianCsv, path.Base(battery_path), summariesOutput.summaries, checkinOutput.batterystats, historianOutput.html, checkinOutput.warnings, errs)
+
+	if err := getTempl.Execute(w, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	log.Printf("Trace ended analyzing file.")
+}
+
 // UploadHandler is the main analysis function.
 func UploadHandler(w http.ResponseWriter, r *http.Request) {
 	// If false, the upload template will load closure and js files in the header.
@@ -117,9 +215,17 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	//GET displays the upload form.
 	case "GET":
-		if err := uploadTempl.Execute(w, uploadData); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		if r.RequestURI != "/" {
+			battery_path := path.Join(batteryFileLocalDir, r.RequestURI)
+			if Exists(battery_path) {
+				DoAnalyze(battery_path, w)
+				return
+			}
+		} else {
+			if err := uploadTempl.Execute(w, uploadData); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 
 	//POST takes the uploaded file(s) and saves it to disk.
